@@ -131,11 +131,11 @@ class SSMDDetector(nn.Module):
         image_list, _ = self.model.transform(images, targets)
         features = self.model.backbone(image_list.tensors)
 
-        # FPN outputs ordered dict  {'0':..,'1':..,'2':..,'3':..,'pool':..}
+        # FPN returns an OrderedDict; head expects a plain list of tensors
         feature_maps = list(features.values())
 
         # Head produces per-level outputs
-        head_outputs = self.model.head(features)
+        head_outputs = self.model.head(feature_maps)
 
         cls_logits = head_outputs['cls_logits']   # list[Tensor[B,A*K,H,W]]
         bbox_reg   = head_outputs['bbox_regression']
