@@ -137,12 +137,14 @@ class SSMDDetector(nn.Module):
         # Head produces per-level outputs
         head_outputs = self.model.head(feature_maps)
 
-        cls_logits = head_outputs['cls_logits']   # list[Tensor[B,A*K,H,W]]
-        bbox_reg   = head_outputs['bbox_regression']
+        cls_logits = head_outputs['cls_logits']    # [B, total_anchors, num_classes]
+        bbox_reg   = head_outputs['bbox_regression']  # [B, total_anchors, 4]
 
-        # Flatten all levels → [B*total_anchors, K] and [B*total_anchors, 4]
-        cls_flat = self._flatten_head_output(cls_logits,
-                                             self.num_classes)
+        # Already flat from newer torchvision — just merge batch dim
+        # cls_logits / bbox_reg are either:
+        #   new API: list of [B, H*W*A, C]  per level  OR  single [B, total, C]
+        #   old API: list of [B, A*C, H, W] per level
+        cls_flat = self._flatten_head_output(cls_logits, self.num_classes)
         reg_flat = self._flatten_head_output(bbox_reg, 4)
 
         return cls_flat, reg_flat
@@ -150,24 +152,37 @@ class SSMDDetector(nn.Module):
     # ------------------------------------------------------------------
     @staticmethod
     def _flatten_head_output(
-        level_outputs: List[torch.Tensor],
+        level_outputs,
         channels: int,
     ) -> torch.Tensor:
         """
-        Flatten spatial + batch dimensions.
+        Accepts whatever shape torchvision's head returns and produces
+        a flat [total_anchors, C] tensor.
 
-        level_outputs: list of [B, A*C, H, W] per FPN level
-        Returns:       [B * sum(A*H*W), C]
+        Handles:
+          • list of [B, A*C, H, W]  — old torchvision spatial layout
+          • list of [B, N, C]        — new torchvision flat layout
+          • single [B, N, C] tensor  — concatenated already
         """
+        # Normalise to a list
+        if isinstance(level_outputs, torch.Tensor):
+            level_outputs = [level_outputs]
+
         flat = []
         for lvl in level_outputs:
-            B, AC, H, W = lvl.shape
-            A = AC // channels
-            # [B, A*C, H, W] → [B, H, W, A, C] → [B*H*W*A, C]
-            lvl = lvl.view(B, A, channels, H, W)
-            lvl = lvl.permute(0, 3, 4, 1, 2).contiguous()
-            lvl = lvl.view(-1, channels)
-            flat.append(lvl)
+            if lvl.dim() == 3:
+                # New API: [B, N, C] → [B*N, C]
+                B, N, C = lvl.shape
+                flat.append(lvl.reshape(B * N, C))
+            elif lvl.dim() == 4:
+                # Old API: [B, A*C, H, W] → [B*H*W*A, C]
+                B, AC, H, W = lvl.shape
+                A = AC // channels
+                lvl = lvl.view(B, A, channels, H, W)
+                lvl = lvl.permute(0, 3, 4, 1, 2).contiguous()
+                flat.append(lvl.view(-1, channels))
+            else:
+                raise ValueError(f"Unexpected head output shape: {lvl.shape}")
         return torch.cat(flat, dim=0)
 
     # ------------------------------------------------------------------
