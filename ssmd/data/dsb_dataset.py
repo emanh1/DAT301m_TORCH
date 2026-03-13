@@ -126,6 +126,16 @@ class DSBDataset(Dataset):
             boxes[:, [0, 2]] *= scale_x
             boxes[:, [1, 3]] *= scale_y
 
+            # Clamp to image bounds
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, ts)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, ts)
+
+            # Drop degenerate boxes (zero width or height)
+            w = boxes[:, 2] - boxes[:, 0]
+            h = boxes[:, 3] - boxes[:, 1]
+            valid = (w > 1e-3) & (h > 1e-3)
+            boxes = boxes[valid]
+
         target = {
             "boxes":  torch.from_numpy(boxes),
             "labels": torch.ones(len(boxes), dtype=torch.long),

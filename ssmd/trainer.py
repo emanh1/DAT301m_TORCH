@@ -90,8 +90,23 @@ class SSMDTrainer:
 
     # ------------------------------------------------------------------
     def _move_targets(self, targets):
-        return [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                 for k, v in t.items()} for t in targets]
+        cleaned = []
+        for t in targets:
+            t = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                 for k, v in t.items()}
+            # Ensure boxes tensor is float32 and labels is int64
+            if "boxes" in t:
+                t["boxes"] = t["boxes"].float()
+            if "labels" in t:
+                t["labels"] = t["labels"].long()
+            # If no valid boxes remain, give a dummy box so RetinaNet doesn't crash
+            if t.get("boxes") is not None and t["boxes"].numel() == 0:
+                t["boxes"]  = torch.zeros((0, 4), dtype=torch.float32,
+                                          device=self.device)
+                t["labels"] = torch.zeros((0,),   dtype=torch.long,
+                                          device=self.device)
+            cleaned.append(t)
+        return cleaned
 
     # ------------------------------------------------------------------
     def train_step(

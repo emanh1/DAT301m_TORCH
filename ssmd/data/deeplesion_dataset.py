@@ -164,12 +164,17 @@ class DeepLesionDataset(Dataset):
         x1, y1, x2, y2 = bbox
         scale_x = ts / orig_w
         scale_y = ts / orig_h
-        boxes = torch.tensor(
+        b = torch.tensor(
             [[x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]],
             dtype=torch.float32
         )
+        # Clamp and drop degenerate boxes
+        b[:, [0, 2]] = b[:, [0, 2]].clamp(0, ts)
+        b[:, [1, 3]] = b[:, [1, 3]].clamp(0, ts)
+        valid = ((b[:, 2] - b[:, 0]) > 1e-3) & ((b[:, 3] - b[:, 1]) > 1e-3)
+        boxes = b[valid]
         target = {
             "boxes":  boxes,
-            "labels": torch.ones(1, dtype=torch.long),
+            "labels": torch.ones(len(boxes), dtype=torch.long),
         }
         return image, target
