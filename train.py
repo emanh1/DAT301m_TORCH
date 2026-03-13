@@ -86,7 +86,7 @@ def get_target_size(args) -> int:
 
 
 def build_loaders(args):
-    from ssmd.data import make_loaders_dsb, make_loaders_deeplesion
+    from ssmd.data.loaders import make_loaders_dsb, make_loaders_deeplesion
     ts = get_target_size(args)
     kw = dict(
         data_dir=args.data_dir,
