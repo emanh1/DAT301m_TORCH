@@ -1,21 +1,13 @@
 """
 Instance-level Adversarial Perturbation — Section 3.3 of SSMD paper.
 
-Goal: perturb the *input image* to maximise the consistency loss between
-student and teacher, focusing perturbation on HIGH-CONFIDENCE foreground
-proposals (Eq. 9).
-
-Unlike standard virtual adversarial training (VAT) that treats all pixels
-equally, SSMD uses an indicator function:
-    1[ Σ p_s^c > τ ]
-to zero-out gradient contributions from low-confidence regions, so only
-foreground proposals drive the adversarial direction.
-
-Two-pass procedure (Algorithm 1, lines 1-2 + Eq. 9):
-  1. Forward student + teacher on the *current* inputs to get consistency loss.
-  2. Back-prop through the consistency loss w.r.t. the noise variable r_adv.
-  3. Normalise the gradient  →  r_adv = ε · g / ‖g‖₂
-  4. Add scaled r_adv to the original image:  Adv(X) = X + ξ · r_adv
+Memory-efficient rewrite:
+  - Student runs under torch.no_grad() to get the foreground mask only.
+    Its graph does NOT need to flow back to r_adv.
+  - Only the teacher forward pass (which takes adv_images as input) needs
+    a gradient graph, and only w.r.t. r_adv — not the full model weights.
+  - If every proposal is background (mask all-zero), we fall back to a
+    plain random perturbation so training continues without crashing.
 """
 
 import torch
@@ -32,52 +24,74 @@ def instance_adversarial_perturbation(
     tau: float = 0.95,
 ) -> torch.Tensor:
     """
-    Generate instance-level adversarial perturbation for a batch of images.
-
     Args:
-        images   : Input images [B, C, H, W]  (teacher branch input)
-        student_net: Callable  x → (cls_logits [N,K], reg_deltas [N,4])
-        teacher_net: Callable  x → (cls_logits [N,K], reg_deltas [N,4])
+        images             : [B, C, H, W] teacher-branch input (on GPU)
+        student_net        : callable x -> (cls_logits [N,K], reg [N,4])
+        teacher_net        : callable x -> (cls_logits [N,K], reg [N,4])
         consistency_loss_fn: AdaptiveConsistencyCost instance
-        xi       : Scale factor for the initial Gaussian seed (Eq. 8, ξ)
-        eps      : Magnitude of the final perturbation  ε  (Eq. 9)
-        tau      : Confidence threshold for foreground mask  τ
+        xi                 : seed perturbation scale xi  (Eq. 8)
+        eps                : final perturbation magnitude eps  (Eq. 9)
+        tau                : foreground confidence threshold tau
 
     Returns:
-        perturbed_images: [B, C, H, W]  — Adv.(X) from Eq. 8
+        perturbed_images: [B, C, H, W] detached
     """
-    # --- Step 1: initialise r_adv from a normalised Gaussian
+
+    # ------------------------------------------------------------------ #
+    # Step 1 — student forward (no grad needed, just for the fg mask)
+    # ------------------------------------------------------------------ #
+    with torch.no_grad():
+        cls_s, reg_s = student_net(images)
+        p_s     = F.softmax(cls_s, dim=-1)
+        fg_prob = 1.0 - p_s[:, 0]
+        mask    = (fg_prob > tau).float()            # [N]
+
+    # If all proposals are background, skip adversarial step entirely.
+    if mask.sum() == 0:
+        noise = torch.randn_like(images)
+        noise = noise / (noise.norm(p=2) + 1e-12)
+        return (images + xi * eps * noise).detach()
+
+    # ------------------------------------------------------------------ #
+    # Step 2 — initialise r_adv seed, gradient attached
+    # ------------------------------------------------------------------ #
     r_adv = torch.randn_like(images)
-    r_adv = r_adv / (r_adv.norm(p=2) + 1e-12)   # unit-norm seed
-    r_adv = r_adv.detach().requires_grad_(True)
+    r_adv = (r_adv / (r_adv.norm(p=2) + 1e-12)).detach().requires_grad_(True)
 
-    # --- Step 2: perturbed forward pass  (teacher sees Adv.(X))
-    adv_images = images + xi * r_adv
+    # ------------------------------------------------------------------ #
+    # Step 3 — teacher forward on perturbed image (graph flows to r_adv)
+    #           images.detach() ensures grad ONLY flows through r_adv
+    # ------------------------------------------------------------------ #
+    adv_images = images.detach() + xi * r_adv
+    cls_t, reg_t = teacher_net(adv_images)
 
-    cls_s, reg_s = student_net(images)      # student on clean images
-    cls_t, reg_t = teacher_net(adv_images)  # teacher on perturbed images
+    cls_t_masked = cls_t * mask.unsqueeze(1)
+    reg_t_masked = reg_t * mask.unsqueeze(1)
 
-    # --- Step 3: build foreground indicator mask  1[ Σ p_s^c > τ ]
-    p_s = F.softmax(cls_s, dim=-1)          # [N, K]
-    fg_prob = 1.0 - p_s[:, 0]              # P(foreground) = 1 - P(bg)
-    mask = (fg_prob > tau).float()          # [N]  indicator
+    loss = consistency_loss_fn(
+        cls_s.detach() * mask.unsqueeze(1),
+        cls_t_masked,
+        reg_s.detach() * mask.unsqueeze(1),
+        reg_t_masked,
+    )
 
-    # Mask the student logits/regs so only foreground drives the gradient
-    cls_s_masked = cls_s * mask.unsqueeze(1)
-    reg_s_masked = reg_s * mask.unsqueeze(1)
+    # ------------------------------------------------------------------ #
+    # Step 4 — gradient w.r.t. r_adv only
+    # ------------------------------------------------------------------ #
+    grad = torch.autograd.grad(
+        loss, r_adv,
+        create_graph=False,
+        retain_graph=False,
+        allow_unused=True,
+    )[0]
 
-    # --- Step 4: consistency loss for gradient computation
-    loss = consistency_loss_fn(cls_s_masked, cls_t,
-                               reg_s_masked, reg_t)
+    if grad is None or grad.abs().max() < 1e-12:
+        noise = torch.randn_like(images)
+        noise = noise / (noise.norm(p=2) + 1e-12)
+        return (images + xi * eps * noise).detach()
 
-    # --- Step 5: compute gradient w.r.t. r_adv  (Eq. 9)
-    grad = torch.autograd.grad(loss, r_adv,
-                               create_graph=False,
-                               retain_graph=False)[0]
-
-    # --- Step 6: normalise and scale  →  r_adv = ε · g / ‖g‖₂
+    # ------------------------------------------------------------------ #
+    # Step 5 — normalise and apply  Adv(X) = X + eps * g/||g||
+    # ------------------------------------------------------------------ #
     r_adv_final = eps * grad / (grad.norm(p=2) + 1e-12)
-
-    # --- Step 7: add to original image  Adv.(X) = X + ξ · r_adv
-    perturbed = (images + xi * r_adv_final).detach()
-    return perturbed
+    return (images.detach() + r_adv_final).detach()
