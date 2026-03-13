@@ -66,6 +66,26 @@ class _NRBWrappedBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Gradient Checkpointing Block Wrapper
+# ---------------------------------------------------------------------------
+
+class _CheckpointedBlock(nn.Module):
+    """Wraps any residual block to recompute activations during backward.
+
+    Uses torch.utils.checkpoint so the backbone's OrderedDict interface
+    (required by FPN) is completely untouched — only individual blocks
+    inside each layer are wrapped.
+    """
+    def __init__(self, block: nn.Module):
+        super().__init__()
+        self.block = block
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from torch.utils.checkpoint import checkpoint
+        return checkpoint(self.block, x, use_reentrant=False)
+
+
+# ---------------------------------------------------------------------------
 # Main Detector
 # ---------------------------------------------------------------------------
 
@@ -107,31 +127,29 @@ class SSMDDetector(nn.Module):
         if use_nrb:
             _inject_nrb(self.model.backbone.body, gamma=nrb_gamma)
 
-        # Gradient checkpointing: recompute activations on backward pass
-        # instead of caching them — ~30% slower but ~40% less VRAM.
+        # Gradient checkpointing: wrap each residual block so activations are
+        # recomputed during backward instead of stored. This saves ~40% VRAM
+        # at the cost of ~20% extra compute. We wrap individual blocks (not
+        # the whole layer) so the OrderedDict backbone interface is untouched.
         if use_grad_ckpt:
-            from torch.utils.checkpoint import checkpoint
-            body = self.model.backbone.body
-            for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
-                layer = getattr(body, layer_name, None)
-                if layer is not None:
-                    for block in layer:
-                        block.apply(
-                            lambda m: m.register_forward_hook(lambda *a: None)
-                        )
-            # Use PyTorch built-in checkpoint on each layer
-            _orig_body_forward = body.__class__.forward
-            def _ckpt_body_forward(self_body, x):
-                import torch.utils.checkpoint as tuc
-                for name, layer in self_body.named_children():
-                    if name in ("layer1", "layer2", "layer3", "layer4"):
-                        x = tuc.checkpoint(layer, x, use_reentrant=False)
-                    else:
-                        x = layer(x)
-                return x
-            body.__class__.forward = _ckpt_body_forward
+            self._apply_grad_ckpt(self.model.backbone.body)
 
         self.num_classes = num_classes
+
+    @staticmethod
+    def _apply_grad_ckpt(body: nn.Module) -> None:
+        """Wrap every ResNet BasicBlock/Bottleneck with gradient checkpointing."""
+        from torchvision.models.resnet import BasicBlock, Bottleneck
+        from torch.utils.checkpoint import checkpoint
+
+        for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
+            layer = getattr(body, layer_name, None)
+            if layer is None:
+                continue
+            for i, block in enumerate(layer):
+                if isinstance(block, (BasicBlock, Bottleneck, _NRBWrappedBlock)):
+                    # Replace block with a CheckpointedBlock wrapper
+                    layer[i] = _CheckpointedBlock(block)
 
     # ------------------------------------------------------------------
     def forward_train(
