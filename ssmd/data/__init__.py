@@ -1,1 +1,1 @@
-__all__= ['loaders']
+from loaders import *
