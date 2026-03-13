@@ -20,8 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.detection import retinanet_resnet50_fpn
-from torchvision.models.detection.retinanet import RetinaNetHead
-from torchvision.ops import sigmoid_focal_loss
+from torchvision.models.detection.retinanet import RetinaNet, RetinaNetHead
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.models import ResNet50_Weights
 
 from .noisy_residual_block import NoisyResidualBlock
 
@@ -90,10 +91,20 @@ class SSMDDetector(nn.Module):
     ):
         super().__init__()
 
-        # torchvision RetinaNet already includes backbone + FPN + Head
-        self.model = retinanet_resnet50_fpn(
-            pretrained=pretrained,
-            num_classes=num_classes + 1,   # +1 for background
+        # Build backbone with pretrained ImageNet weights (new API, no deprecation)
+        backbone = resnet_fpn_backbone(
+            backbone_name="resnet50",
+            weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None,
+            trainable_layers=3,
+        )
+
+        # Build RetinaNet fresh with the correct num_classes for our task.
+        # RetinaNet's head does NOT include a background class — num_classes is
+        # the number of foreground classes only (e.g. 1 for nuclei/lesion).
+        # We intentionally skip COCO weights on the head to avoid the 91-class mismatch.
+        self.model = RetinaNet(
+            backbone=backbone,
+            num_classes=num_classes,
             score_thresh=score_thresh,
         )
 
@@ -131,7 +142,7 @@ class SSMDDetector(nn.Module):
 
         # Flatten all levels → [B*total_anchors, K] and [B*total_anchors, 4]
         cls_flat = self._flatten_head_output(cls_logits,
-                                             self.num_classes + 1)
+                                             self.num_classes)
         reg_flat = self._flatten_head_output(bbox_reg, 4)
 
         return cls_flat, reg_flat
