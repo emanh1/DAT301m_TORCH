@@ -58,6 +58,13 @@ def parse_args():
     p.add_argument("--cutout_s",         type=int,   default=70)
     p.add_argument("--max_rot_deg",      type=float, default=10.0)
 
+    # Memory
+    p.add_argument("--image_size",       type=int,   default=None,
+                   help="Override default image size (dsb=448, dl=512). "
+                        "Reduce (e.g. 256) to save VRAM.")
+    p.add_argument("--no_grad_ckpt",     action="store_true",
+                   help="Disable gradient checkpointing (faster but uses more VRAM)")
+
     # I/O
     p.add_argument("--ckpt_dir",         type=str,   default="ckpts")
     p.add_argument("--save_every",       type=int,   default=5,
@@ -72,13 +79,15 @@ def parse_args():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_target_size(dataset: str) -> int:
-    return 448 if dataset == "dsb" else 512
+def get_target_size(args) -> int:
+    if args.image_size is not None:
+        return args.image_size
+    return 448 if args.dataset == "dsb" else 512
 
 
 def build_loaders(args):
-    from ssmd.data.loaders import make_loaders_dsb, make_loaders_deeplesion
-    ts = get_target_size(args.dataset)
+    from ssmd.data import make_loaders_dsb, make_loaders_deeplesion
+    ts = get_target_size(args)
     kw = dict(
         data_dir=args.data_dir,
         labeled_fraction=args.labeled_fraction,
@@ -138,6 +147,7 @@ def main():
         cutout_s=args.cutout_s,
         max_rot_deg=args.max_rot_deg,
         nrb_gamma=args.nrb_gamma,
+        use_grad_ckpt=not args.no_grad_ckpt,
     )
 
     if args.resume:

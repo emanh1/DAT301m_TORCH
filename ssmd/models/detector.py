@@ -88,20 +88,16 @@ class SSMDDetector(nn.Module):
         nrb_gamma: float = 0.9,
         pretrained: bool = True,
         score_thresh: float = 0.05,
+        use_grad_ckpt: bool = True,
     ):
         super().__init__()
 
-        # Build backbone with pretrained ImageNet weights (new API, no deprecation)
         backbone = resnet_fpn_backbone(
             backbone_name="resnet50",
             weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None,
             trainable_layers=3,
         )
 
-        # Build RetinaNet fresh with the correct num_classes for our task.
-        # RetinaNet's head does NOT include a background class — num_classes is
-        # the number of foreground classes only (e.g. 1 for nuclei/lesion).
-        # We intentionally skip COCO weights on the head to avoid the 91-class mismatch.
         self.model = RetinaNet(
             backbone=backbone,
             num_classes=num_classes,
@@ -110,6 +106,30 @@ class SSMDDetector(nn.Module):
 
         if use_nrb:
             _inject_nrb(self.model.backbone.body, gamma=nrb_gamma)
+
+        # Gradient checkpointing: recompute activations on backward pass
+        # instead of caching them — ~30% slower but ~40% less VRAM.
+        if use_grad_ckpt:
+            from torch.utils.checkpoint import checkpoint
+            body = self.model.backbone.body
+            for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
+                layer = getattr(body, layer_name, None)
+                if layer is not None:
+                    for block in layer:
+                        block.apply(
+                            lambda m: m.register_forward_hook(lambda *a: None)
+                        )
+            # Use PyTorch built-in checkpoint on each layer
+            _orig_body_forward = body.__class__.forward
+            def _ckpt_body_forward(self_body, x):
+                import torch.utils.checkpoint as tuc
+                for name, layer in self_body.named_children():
+                    if name in ("layer1", "layer2", "layer3", "layer4"):
+                        x = tuc.checkpoint(layer, x, use_reentrant=False)
+                    else:
+                        x = layer(x)
+                return x
+            body.__class__.forward = _ckpt_body_forward
 
         self.num_classes = num_classes
 
